@@ -1,0 +1,112 @@
+pipeline {
+  agent any
+  options { timestamps() }
+
+  parameters {
+    string(name: 'HUGGINGFACE_REPO', defaultValue: 'ScanMe/test-models', description: 'HF repo to scan (owner/name)')
+    string(name: 'MODEL_NAME',    defaultValue: 'smoke', description: 'Model name for the test scan')
+    string(name: 'MODEL_VERSION', defaultValue: 'v0',    description: 'Model version for the test scan')
+    choice(name: 'FAIL_ON_SEVERITY', choices: ['NONE','LOW','MEDIUM','HIGH','CRITICAL'], description: 'Fail build at or above this severity (NONE disables)')
+    booleanParam(name: 'FAIL_ON_UNSUPPORTED', defaultValue: false, description: 'Fail if any file type is unsupported')
+  }
+
+  environment {
+    HL_CLIENT_ID     = credentials('hl_client_id')
+    HL_CLIENT_SECRET = credentials('hl_client_secret')
+    HL_LICENSE       = credentials('hl_license') 
+  }
+
+  stages {
+    stage('Docker preflight') {
+      steps {
+        sh '''
+          bash -lc '
+            set -Ee -o pipefail
+            echo "User: $(id)"
+            echo "Socket:"; ls -l /var/run/docker.sock || true
+            echo "docker version:"; docker version
+          '
+        '''
+      }
+    }
+
+
+    stage('Registry login (quay.io)') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'quay_creds', usernameVariable: 'QUAY_USER', passwordVariable: 'QUAY_PASS')]) {
+          sh '''
+            bash -lc '
+              set -Ee -o pipefail
+              echo "$QUAY_PASS" | docker login quay.io -u "$QUAY_USER" --password-stdin
+            '
+          '''
+        }
+      }
+    }
+
+    stage('Pull HiddenLayer CLI image') {
+      steps {
+        sh '''
+          bash -lc '
+            set -Ee -o pipefail
+            docker pull --platform=linux/amd64 quay.io/hiddenlayer/distro-cli-modelscanner:latest
+          '
+        '''
+      }
+    }
+
+    stage('CLI sanity: --version / --help') {
+      steps {
+        sh '''
+          bash -lc '
+            set -Ee -o pipefail
+            echo ">>> hlms --version"
+            docker run --rm quay.io/hiddenlayer/distro-cli-modelscanner:latest --version || true
+            echo ">>> hlms --help (first 50 lines)"
+            docker run --rm quay.io/hiddenlayer/distro-cli-modelscanner:latest --help | head -n 50 || true
+          '
+        '''
+      }
+    }
+
+    stage('Scan Hugging Face repo directly (no local download)') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'quay_creds', usernameVariable: 'QUAY_USER', passwordVariable: 'QUAY_PASS')]) {
+          sh '''
+            bash -lc '
+              set -Ee -o pipefail
+              echo "$QUAY_PASS" | docker login quay.io -u "$QUAY_USER" --password-stdin
+
+              HF_REPO="${HUGGINGFACE_REPO:-ScanMe/test-models}"
+              echo "Scanning HF repo: $HF_REPO"
+
+              docker run --rm --platform=linux/amd64 \
+                -e HL_LICENSE="${HL_LICENSE:-}" \
+                -e HL_CLIENT_ID="$HL_CLIENT_ID" \
+                -e HL_CLIENT_SECRET="$HL_CLIENT_SECRET" \
+                -e HF_TOKEN="${HF_TOKEN:-}" \
+                quay.io/hiddenlayer/distro-cli-modelscanner:latest \
+                  --input "https://huggingface.co/${HF_REPO}/tree/main" \
+                  --persist \
+                  --model-name="${MODEL_NAME:-smoke}" \
+                  --model-version="${MODEL_VERSION:-v0}"
+
+              docker logout quay.io || true
+            '
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      sh '''
+        bash -lc '
+          docker logout quay.io || true
+        '
+      '''
+      archiveArtifacts artifacts: 'smoke/**,hlms-output/**', onlyIfSuccessful: false
+    }
+  }
+}
